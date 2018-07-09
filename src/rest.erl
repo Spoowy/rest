@@ -7,12 +7,12 @@ behaviour_info(callbacks) -> [{exists, 1}, {get, 0}, {get, 1}, {post, 1}, {delet
 behaviour_info(_) -> undefined.
 
 parse_transform(Forms, _Options) ->
-%    io:format("~p~n", [Forms]),
+    io:format("~p~n", [Forms]),
     RecordName = rest_record(Forms),
     RecordFields = record_fields(RecordName, Forms),
     Forms1 = generate({from_json, 2}, RecordName, RecordFields, Forms),
     Forms2 = generate({to_json, 1}, RecordName, RecordFields, Forms1),
-%    io:format("~p~n", [Forms2]),
+    io:format("~p~n", [Forms2]),
     Forms2.
 
 rest_record([]) -> [];
@@ -20,17 +20,13 @@ rest_record([{attribute, _, rest_record, RecordName} | _Forms]) -> RecordName;
 rest_record([_ | Forms]) -> rest_record(Forms).
 
 record_field({record_field, _, {atom, _, Field}   }) -> Field;
-record_field({record_field, _, {atom, _, Field}, _}) -> Field;
-record_field({typed_record_field, {record_field,_,{atom, _, Field},_}, _}) -> Field.
+record_field({record_field, _, {atom, _, Field}, _}) -> Field.
 
 record_fields(RecordName, [{attribute, _, record, {RecordName, Fields}} | _Forms]) ->
     [record_field(Field) || Field <- Fields];
 record_fields(RecordName, [_ | Forms]) -> record_fields(RecordName, Forms).
 
-last_export_line(Exports) ->
-    case lists:reverse(Exports) of
-         [{_, Line, _, _} | _] -> Line;
-         _ -> 0 end.
+last_export_line(Exports) -> [{_, Line, _, _} | _] = lists:reverse(Exports), Line.
 
 generate({FunName, _Arity} = Fun, Record, Fields, Forms) ->
     Exports = lists:filter(fun({attribute, _, export, _}) -> true; (_) -> false end, Forms),
@@ -128,7 +124,17 @@ props_skip({Key, Value}, Acc) -> [{Key, from_json(Value)} | Acc].
 to_json(Data) ->
     case is_string(Data) of
         true  -> rest:to_binary(Data);
-        false -> json_match(Data)
+        false ->
+          % convert tuple to string
+          case is_tuple(Data) of
+            true  -> rest:to_binary(wf:to_list(Data));
+            false ->
+              % remove binary values for e.g. password
+              case is_binary(Data) of
+                true  -> "";
+                false -> json_match(Data)
+              end
+          end
     end.
 
 json_match([{_, _} | _] = Props) -> [{rest:to_binary(Key), to_json(Value)} || {Key, Value} <- Props];

@@ -1,6 +1,6 @@
 -module(rest_cowboy).
 -author('Dmitry Bushmelev').
--record(st, {resource_module = undefined :: atom(), resource_id = undefined :: binary()}).
+-record(st, {resource_module = undefined :: atom(), resource_id = undefined :: binary(), user_id = undefined :: integer()}).
 -export([init/3, rest_init/2, resource_exists/2, allowed_methods/2, content_types_provided/2,
          to_html/2, to_json/2, content_types_accepted/2, delete_resource/2,
          handle_urlencoded_data/2, handle_json_data/2]).
@@ -14,17 +14,20 @@ init(_, _, _) -> {upgrade, protocol, cowboy_rest}.
 rest_init(Req, _Opts) ->
     {Resource, Req1} = cowboy_req:binding(resource, Req),
     Module = case rest_module(Resource) of {ok, M} -> M; _ -> undefined end,
-    {Id, Req2} = cowboy_req:binding(id, Req1),
+    {Id1, Req2} = cowboy_req:binding(id, Req1),
     {Origin, Req3} = cowboy_req:header(<<"origin">>, Req2, <<"*">>),
-    Req4 = cowboy_req:set_resp_header(<<"Access-Control-Allow-Origin">>, Origin, Req3),
-    {ok, Req4, #st{resource_module = Module, resource_id = Id}}.
+    Req4 = cowboy_req:set_resp_header(<<"Access-Control-Allow-Origin">>, "*", Req3),%Origin, Req3),
+    Req5 = cowboy_req:set_resp_header(<<"Access-Control-Allow-Methods">>, "*", Req4),%Origin, Req3),
+    Id2 = case guard:is_empty(Id1) of false -> wf:to_integer(Id1); _-> Id1 end,
+    {User, _} = cowboy_req:qs_val(<<"user">>, Req),
+    {ok, Req5, #st{resource_module = Module, resource_id = Id2, user_id = case User of undefined -> undefined; _-> wf:to_integer(User) end}}.
 
 resource_exists(Req, #st{resource_module = undefined} = State)       -> {false, Req, State};
 resource_exists(Req, #st{resource_id     = undefined} = State)       -> {true, Req, State};
 resource_exists(Req, #st{resource_module = M, resource_id = Id} = S) -> {M:exists(Id), Req, S}.
 
 allowed_methods(Req, #st{resource_id = undefined} = State) -> {[<<"GET">>, <<"POST">>], Req, State};
-allowed_methods(Req, State)                                -> {[<<"GET">>, <<"PUT">>, <<"DELETE">>], Req, State}.
+allowed_methods(Req, State)                                -> {[<<"GET">>, <<"PUT">>, <<"OPTIONS">>, <<"DELETE">>], Req, State}.
 
 content_types_provided(Req, #st{resource_module = M} = State) ->
     {case erlang:function_exported(M, to_html, 1) of
@@ -32,10 +35,18 @@ content_types_provided(Req, #st{resource_module = M} = State) ->
          false -> [{<<"application/json">>, to_json}] end,
      Req, State}.
 
-to_html(Req, #st{resource_module = M, resource_id = Id} = State) ->
+module_get(M, Id, UserId)->
+  % ExportsUserFunc = erlang:function_exported(M, html_layout, 2),
+  case Id of
+    undefined when UserId == undefined -> M:get();
+    undefined when UserId =/= undefined -> M:get(user_req, UserId);
+    _ when UserId == undefined -> M:get(Id);
+    _ when UserId =/= undefined -> M:get(Id, user_req, UserId) end.
+
+to_html(Req, #st{resource_module = M, resource_id = Id, user_id = UserId} = State) ->
     Body = case Id of
-               undefined -> [M:to_html(Resource) || Resource <- M:get()];
-               _ -> M:to_html(M:get(Id)) end,
+               undefined -> [M:to_html(Resource) || Resource <- module_get(M, Id, UserId)];
+               _ -> M:to_html(module_get(M, Id, UserId)) end,
     Html = case erlang:function_exported(M, html_layout, 2) of
                true  -> M:html_layout(Req, Body);
                false -> default_html_layout(Body) end,
@@ -43,25 +54,28 @@ to_html(Req, #st{resource_module = M, resource_id = Id} = State) ->
 
 default_html_layout(Body) -> [<<"<html><body>">>, Body, <<"</body></html>">>].
 
-to_json(Req, #st{resource_module = M, resource_id = Id} = State) ->
+to_json(Req, #st{resource_module = M, resource_id = Id, user_id = UserId} = State) ->
     Struct = case Id of
-                 undefined -> [{M, [ M:to_json(Resource) || Resource <- M:get() ] } ];
-                 _         -> M:to_json(M:get(Id)) end,
+                 undefined -> [{M, [ M:to_json(Resource) || Resource <- module_get(M, Id, UserId) ] } ];
+                 _         -> M:to_json(module_get(M, Id, UserId)) end,
     {iolist_to_binary(?REST_JSON:encode(Struct)), Req, State}.
 
 content_types_accepted(Req, State) -> {[{<<"application/x-www-form-urlencoded">>, handle_urlencoded_data},
+                                        {<<"application/x-www-form-urlencoded; charset=UTF-8">>, handle_urlencoded_data},
+                                        {<<"application/json; charset=UTF-8">>, handle_json_data},
                                         {<<"application/json">>, handle_json_data}], Req, State}.
 
 handle_urlencoded_data(Req, #st{resource_module = M, resource_id = Id} = State) ->
-    {ok, Data, Req2} = cowboy_req:body_qs(Req),
+    {ok, Data, Req2} = cowboy_req:body_qs(Req, [{length, 100000000}]),
     {handle_data(M, Id, Data), Req2, State}.
 
 handle_json_data(Req, #st{resource_module = M, resource_id = Id} = State) ->
-    {ok, Binary, Req2} = cowboy_req:body(Req),
+    {ok, Binary, Req2} = cowboy_req:body(Req, [{length, 100000000}]),
     Data = case ?REST_JSON:decode(Binary) of {struct, Struct} -> Struct; S -> S end,
     {handle_data(M, Id, Data), Req2, State}.
 
-handle_data(Mod, Id, Data) ->
+handle_data(Mod, IdIn, Data) ->
+    Id = case IdIn of undefined -> undefined; _-> wf:to_integer(IdIn) end,
     Valid = case erlang:function_exported(Mod, validate, 2) of
                 true  -> Mod:validate(Id, Data);
                 false -> default_validate(Mod, Id, Data) end,
